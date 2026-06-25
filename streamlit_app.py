@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 st.set_page_config(
@@ -73,6 +74,125 @@ def simplify_question_text(text: str) -> str:
     text = re.sub(r"\s*\(1\s*[–-].*$", "", text).strip()
     text = re.sub(r"\s*\(где\s+1\s*[–-].*$", "", text, flags=re.IGNORECASE).strip()
     return text
+
+
+
+
+def shorten_label(value: object, max_chars: int = 34, prefer_question_number: bool = False) -> str:
+    """Короткая подпись для осей графиков. Полный текст остаётся в hover/таблице."""
+    text = simplify_question_text(value)
+    if not text:
+        return ""
+    number = extract_question_number(text)
+    if prefer_question_number and number:
+        return number
+    if number and len(text) > max_chars:
+        # Для вопросов оставляем номер: он нужен как якорь для расшифровки под графиком.
+        tail = re.sub(r"^\s*" + re.escape(number) + r"\s*[.\-–—:]*\s*", "", text).strip()
+        available = max(8, max_chars - len(number) - 2)
+        if len(tail) > available:
+            tail = tail[: available - 1].rstrip() + "…"
+        return f"{number}. {tail}"
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip() + "…"
+
+
+def make_unique_labels(values: List[object], max_chars: int = 34, prefer_question_number: bool = False) -> List[str]:
+    labels: List[str] = []
+    seen: Dict[str, int] = {}
+    for value in values:
+        label = shorten_label(value, max_chars=max_chars, prefer_question_number=prefer_question_number)
+        if not label:
+            label = "—"
+        if label in seen:
+            seen[label] += 1
+            label = f"{label} [{seen[label]}]"
+        else:
+            seen[label] = 1
+        labels.append(label)
+    return labels
+
+
+def format_heatmap_text(matrix: pd.DataFrame) -> List[List[str]]:
+    result: List[List[str]] = []
+    for row in matrix.to_numpy(dtype=float):
+        formatted_row: List[str] = []
+        for value in row:
+            if pd.isna(value):
+                formatted_row.append("")
+            elif abs(value) >= 100:
+                formatted_row.append(f"{value:.0f}")
+            elif abs(value) >= 10:
+                formatted_row.append(f"{value:.1f}")
+            else:
+                formatted_row.append(f"{value:.2f}".rstrip("0").rstrip("."))
+        result.append(formatted_row)
+    return result
+
+
+def readable_heatmap(
+    matrix: pd.DataFrame,
+    title: str,
+    value_name: str = "Значение",
+    row_kind: str = "Вопрос",
+    col_kind: str = "Сегмент",
+    prefer_question_numbers_on_y: bool = True,
+    max_x_label_chars: int = 22,
+    max_y_label_chars: int = 38,
+    show_values: bool = True,
+    height: Optional[int] = None,
+) -> go.Figure:
+    """Plotly heatmap с короткими осями и полными подписями в наведении."""
+    x_full = [str(x) for x in matrix.columns.tolist()]
+    y_full = [str(y) for y in matrix.index.tolist()]
+    x_short = make_unique_labels(x_full, max_chars=max_x_label_chars, prefer_question_number=False)
+    y_short = make_unique_labels(y_full, max_chars=max_y_label_chars, prefer_question_number=prefer_question_numbers_on_y)
+
+    z = matrix.astype(float).to_numpy()
+    customdata = []
+    for y in y_full:
+        row = []
+        for x in x_full:
+            row.append([y, x])
+        customdata.append(row)
+
+    text = format_heatmap_text(matrix) if show_values else None
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=z,
+            x=x_short,
+            y=y_short,
+            customdata=customdata,
+            text=text,
+            texttemplate="%{text}" if show_values else None,
+            textfont={"size": 11},
+            colorscale="Blues",
+            colorbar={"title": value_name},
+            hovertemplate=(
+                f"<b>{row_kind}</b>: %{{customdata[0]}}<br>"
+                f"<b>{col_kind}</b>: %{{customdata[1]}}<br>"
+                f"<b>{value_name}</b>: %{{z:.3g}}<extra></extra>"
+            ),
+        )
+    )
+    if height is None:
+        height = max(460, min(1000, 220 + 38 * max(1, matrix.shape[0])))
+    tickangle = -35 if any(len(str(x)) > 12 for x in x_short) else 0
+    fig.update_layout(
+        title=title,
+        height=height,
+        margin={"l": 110, "r": 40, "t": 80, "b": 120},
+        xaxis={"tickangle": tickangle, "automargin": True},
+        yaxis={"automargin": True},
+    )
+    return fig
+
+
+def label_mapping_df(values: List[object], label_type: str, max_chars: int = 38, prefer_question_number: bool = False) -> pd.DataFrame:
+    full = [str(v) for v in values]
+    short = make_unique_labels(full, max_chars=max_chars, prefer_question_number=prefer_question_number)
+    return pd.DataFrame({"Тип": label_type, "Подпись на графике": short, "Полный текст": full})
 
 
 def make_unique_columns(cols: List[str]) -> List[str]:
@@ -612,8 +732,25 @@ def render_crosstabs_page():
             st.warning("Нет данных для таблицы.")
             return
         st.dataframe(table, use_container_width=True)
-        fig = px.imshow(table, text_auto=True, aspect="auto", title=f"{row_q} × {col_q}: {metric}")
+        show_values = st.checkbox("Показывать числа на тепловой карте", value=True, key="cat_heatmap_values")
+        fig = readable_heatmap(
+            table,
+            title=f"{shorten_label(row_q, 70)} × {shorten_label(col_q, 70)}: {metric}",
+            value_name=metric,
+            row_kind="Строка",
+            col_kind="Колонка",
+            prefer_question_numbers_on_y=False,
+            max_x_label_chars=22,
+            max_y_label_chars=42,
+            show_values=show_values,
+        )
         st.plotly_chart(fig, use_container_width=True)
+        with st.expander("Расшифровка коротких подписей"):
+            mapping = pd.concat([
+                label_mapping_df(table.index.tolist(), "Строка", max_chars=42),
+                label_mapping_df(table.columns.tolist(), "Колонка", max_chars=22),
+            ], ignore_index=True)
+            st.dataframe(mapping, use_container_width=True, hide_index=True)
     else:
         if not rating or not categorical:
             st.info("Нужен хотя бы один шкальный вопрос и один сегмент.")
@@ -662,8 +799,29 @@ def render_heatmaps_page():
             return
         matrix = pd.DataFrame(rows).set_index("Вопрос").fillna(np.nan)
         st.dataframe(matrix, use_container_width=True)
-        fig = px.imshow(matrix, text_auto=True, aspect="auto", title=f"{metric}: вопросы × {seg_q}")
+        c1, c2, c3 = st.columns([1, 1, 1])
+        show_values = c1.checkbox("Показывать числа", value=True, key="segment_heatmap_values")
+        compact_questions = c2.checkbox("На оси Y только номера вопросов", value=True, key="segment_heatmap_compact_y")
+        chart_height = c3.slider("Высота графика", min_value=420, max_value=1100, value=max(460, min(900, 220 + 44 * len(matrix))), step=40)
+        fig = readable_heatmap(
+            matrix,
+            title=f"{metric}: вопросы × {shorten_label(seg_q, 70)}",
+            value_name=metric,
+            row_kind="Вопрос",
+            col_kind="Сегмент",
+            prefer_question_numbers_on_y=compact_questions,
+            max_x_label_chars=22,
+            max_y_label_chars=46,
+            show_values=show_values,
+            height=chart_height,
+        )
         st.plotly_chart(fig, use_container_width=True)
+        with st.expander("Расшифровка коротких подписей"):
+            mapping = pd.concat([
+                label_mapping_df(matrix.index.tolist(), "Вопрос", max_chars=46, prefer_question_number=compact_questions),
+                label_mapping_df(matrix.columns.tolist(), "Сегмент", max_chars=22),
+            ], ignore_index=True)
+            st.dataframe(mapping, use_container_width=True, hide_index=True)
     else:
         multi_cols = catalog.loc[catalog["include"] & catalog["type"].eq("multiple_choice"), "column"].tolist()
         if not multi_cols:
@@ -683,8 +841,25 @@ def render_heatmaps_page():
                 for b in opts_set:
                     data.loc[a, b] += 1
         st.dataframe(data, use_container_width=True)
-        fig = px.imshow(data, text_auto=True, aspect="auto", title=f"Co-occurrence: {q}")
+        show_values = st.checkbox("Показывать числа", value=True, key="cooccurrence_values")
+        fig = readable_heatmap(
+            data,
+            title=f"Co-occurrence: {shorten_label(q, 80)}",
+            value_name="Количество",
+            row_kind="Вариант",
+            col_kind="Вариант",
+            prefer_question_numbers_on_y=False,
+            max_x_label_chars=24,
+            max_y_label_chars=36,
+            show_values=show_values,
+        )
         st.plotly_chart(fig, use_container_width=True)
+        with st.expander("Расшифровка коротких подписей"):
+            mapping = pd.concat([
+                label_mapping_df(data.index.tolist(), "Строка", max_chars=36),
+                label_mapping_df(data.columns.tolist(), "Колонка", max_chars=24),
+            ], ignore_index=True)
+            st.dataframe(mapping, use_container_width=True, hide_index=True)
 
 
 def render_drivers_page():
@@ -703,8 +878,25 @@ def render_drivers_page():
     method = st.selectbox("Метод корреляции", ["spearman", "pearson"], index=0)
     corr = nums.corr(method=method).round(2)
     st.dataframe(corr, use_container_width=True)
-    fig = px.imshow(corr, text_auto=True, zmin=-1, zmax=1, aspect="auto", title=f"Корреляции ({method})")
+    fig = readable_heatmap(
+        corr,
+        title=f"Корреляции ({method})",
+        value_name="Корреляция",
+        row_kind="Вопрос",
+        col_kind="Вопрос",
+        prefer_question_numbers_on_y=True,
+        max_x_label_chars=18,
+        max_y_label_chars=34,
+        show_values=True,
+    )
+    fig.update_traces(colorscale="RdBu", zmin=-1, zmax=1)
     st.plotly_chart(fig, use_container_width=True)
+    with st.expander("Расшифровка коротких подписей"):
+        mapping = pd.concat([
+            label_mapping_df(corr.index.tolist(), "Строка", max_chars=34, prefer_question_number=True),
+            label_mapping_df(corr.columns.tolist(), "Колонка", max_chars=18, prefer_question_number=True),
+        ], ignore_index=True)
+        st.dataframe(mapping, use_container_width=True, hide_index=True)
 
     st.subheader("Driver analysis")
     outcome_candidates = catalog.loc[catalog["include"] & catalog["type"].isin(["rating", "numeric"]), "column"].tolist()
@@ -804,8 +996,24 @@ def render_open_text_page():
                 if not merged.empty:
                     tab = pd.crosstab(merged["Тема"], merged[seg_q])
                     st.dataframe(tab, use_container_width=True)
-                    fig = px.imshow(tab, text_auto=True, aspect="auto", title=f"Темы × {seg_q}")
+                    fig = readable_heatmap(
+                        tab,
+                        title=f"Темы × {shorten_label(seg_q, 70)}",
+                        value_name="Количество",
+                        row_kind="Тема",
+                        col_kind="Сегмент",
+                        prefer_question_numbers_on_y=False,
+                        max_x_label_chars=24,
+                        max_y_label_chars=38,
+                        show_values=True,
+                    )
                     st.plotly_chart(fig, use_container_width=True)
+                    with st.expander("Расшифровка коротких подписей"):
+                        mapping = pd.concat([
+                            label_mapping_df(tab.index.tolist(), "Тема", max_chars=38),
+                            label_mapping_df(tab.columns.tolist(), "Сегмент", max_chars=24),
+                        ], ignore_index=True)
+                        st.dataframe(mapping, use_container_width=True, hide_index=True)
 
 
 def render_export_page():
